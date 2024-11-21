@@ -1,6 +1,6 @@
 use crate::types::{
     inbox_contract_from, BatchPosterPosition, BroadcastFeedMessage, BroadcastMessage,
-    BuildingBatch, Config, InboxContract,
+    BuildingBatch, Config, InboxContract, L1_MESSAGE_TYPE_BATCH_POSTING_REPORT,
 };
 use anyhow::Result;
 use futures_util::StreamExt;
@@ -20,7 +20,6 @@ use tokio_tungstenite::connect_async;
 pub struct BatchPoster {
     feed_handler: SequencerFeedHandler,
     sequencer_inbox: InboxContract,
-    poll_interval: Interval,
     max_batch_post_interval: Duration,
     building_batch: Option<BuildingBatch>,
     batchposter_position: BatchPosterPosition,
@@ -36,7 +35,6 @@ impl From<Config> for BatchPoster {
         Self {
             feed_handler: SequencerFeedHandler::new(config.feed_url),
             sequencer_inbox,
-            poll_interval: time::interval(config.poll_interval),
             max_batch_post_interval: config.max_batch_post_interval,
             building_batch: Default::default(),
             batchposter_position: BatchPosterPosition {
@@ -58,32 +56,6 @@ impl BatchPoster {
         self.consume_feed().await?;
 
         feed_producer.await?
-    }
-
-    pub async fn consume_feed(&mut self) -> Result<()> {
-        let consumer = self.feed_handler.consumer();
-
-        while let Some(broadcast_msg) = consumer.recv().await {
-            println!("Received message: {:?}", broadcast_msg);
-            if !broadcast_msg.messages.is_empty() {
-                self.incoming_messages
-                    .extend_from_slice(&broadcast_msg.messages);
-
-                self.msg_count += broadcast_msg.messages.len() as u64;
-                println!("Total number of messages: {}", self.msg_count);
-            }
-
-            if self.first_incoming_msg_time.is_none() {
-                // find the first message to set the time of the batch initialization to later force a batch post
-                self.first_incoming_msg_time = self.incoming_messages.first().map(|msg| {
-                    UNIX_EPOCH + Duration::from_secs(msg.message.message.header.timestamp)
-                });
-            }
-
-            self.poll_interval.tick().await;
-        }
-
-        Ok(())
     }
 
     pub fn produce_sequencer_feed(&self) -> JoinHandle<Result<()>> {
@@ -110,27 +82,70 @@ impl BatchPoster {
         })
     }
 
-    pub async fn maybe_post_batch(&mut self) -> Result<()> {
-        let batch_position = self.batchposter_position.clone();
+    pub async fn consume_feed(&mut self) -> Result<()> {
+        let consumer = self.feed_handler.consumer();
 
-        if self.building_batch.is_none() {
-            self.building_batch = Some(BuildingBatch::new(
-                batch_position.msg_count,
-                batch_position.msg_count,
-                batch_position.delayed_msg_count,
-            ));
+        while let Some(broadcast_msg) = consumer.recv().await {
+            println!("Received message: {:?}", broadcast_msg);
+            if !broadcast_msg.messages.is_empty() {
+                self.incoming_messages
+                    .extend_from_slice(&broadcast_msg.messages);
+
+                self.msg_count += broadcast_msg.messages.len() as u64;
+                println!("Total number of messages: {}", self.msg_count);
+            }
+
+            if self.first_incoming_msg_time.is_none() {
+                // find the first message to set the time of the batch initialization to later force a batch post
+                self.first_incoming_msg_time = self.incoming_messages.first().map(|msg| {
+                    UNIX_EPOCH + Duration::from_secs(msg.message.message.header.timestamp)
+                });
+            }
+
+            if self.building_batch.is_none() {
+                self.building_batch = Some(BuildingBatch::new(
+                    self.batchposter_position.msg_count,
+                    self.batchposter_position.msg_count,
+                    self.batchposter_position.delayed_msg_count,
+                ));
+            }
+
+            let mut force_post_batch = self.first_incoming_msg_time.map_or(false, |msg_time| {
+                msg_time.elapsed().unwrap() >= self.max_batch_post_interval
+            });
+
+            let mut have_useful_message = false;
+
+            let dispatchable_messages = mem::take(&mut self.incoming_messages);
+
+            let building = self.building_batch.as_mut().unwrap();
+            for msg in dispatchable_messages {
+                let msg = msg.message;
+                let success = building.segments.add_message(&msg)?;
+                if !success {
+                    // batch is full
+                    have_useful_message = true;
+                    force_post_batch = true;
+                    break;
+                }
+                if msg.message.header.kind != L1_MESSAGE_TYPE_BATCH_POSTING_REPORT {
+                    have_useful_message = true;
+                }
+                building.msg_count += 1;
+            }
+
+            if !force_post_batch || !have_useful_message {
+                // the batch isn't full yet and we've posted a batch recently
+                // don't post anything for now
+                continue;
+            }
+
+            let sequencer_msg = building.segments.close_and_get_bytes()?;
         }
 
-        let force_post_batch = self.first_incoming_msg_time.map_or(false, |msg_time| {
-            msg_time.elapsed().unwrap() >= self.max_batch_post_interval
-        });
-
-        let dispatchable_messages = mem::take(&mut self.incoming_messages);
-        for msg in dispatchable_messages {
-            // process the message
-        }
-
-        Ok(())
+        Err(anyhow::anyhow!(
+            "Consumer stopped, incoming feed must not stop"
+        ))
     }
 }
 

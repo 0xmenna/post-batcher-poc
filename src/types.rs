@@ -11,8 +11,21 @@ use ethers::{
 };
 use serde::Deserialize;
 use serde_json::Value;
-use std::{fs, sync::Arc, time::Duration};
+use std::{char::MAX, f32::consts::E, fs, io::Write, sync::Arc, time::Duration};
 use tokio::time::{self, Interval};
+
+const BATCH_SEGMENT_KIND_L2_MESSAGE: u8 = 0;
+const BATCH_SEGMENT_KIND_L2_MESSAGE_BROTLI: u8 = 1;
+const BATCH_SEGMENT_KIND_DELAYED_MESSAGES: u8 = 2;
+const BATCH_SEGMENT_KIND_ADVANCE_TIMESTAMP: u8 = 3;
+const BATCH_SEGMENT_KIND_ADVANCE_L1_BLOCK_NUMBER: u8 = 4;
+
+const MAX_DECOMPRESSED_LEN: usize = 1024 * 1024 * 16; // 16 MiB
+const MAX_SEGMENTS_PER_SEQUENCER_MESSAGE: usize = 100 * 1024;
+
+const BROTLIMESSAGEHEADERBYTE: u8 = 0;
+
+pub const L1_MESSAGE_TYPE_BATCH_POSTING_REPORT: u8 = 13;
 
 /// Simple configuration for the batch poster
 #[derive(Debug, Clone, Deserialize)]
@@ -22,7 +35,6 @@ pub struct Config {
     pub privkey: String,
     pub sequencer_inbox_address: Address,
     pub contract_abi_path: String,
-    pub poll_interval: Duration,
     pub max_batch_post_interval: Duration,
 }
 
@@ -39,7 +51,6 @@ impl Default for Config {
                 .parse()
                 .unwrap(),
             contract_abi_path: "SequencerInbox.json".to_string(),
-            poll_interval: Duration::from_secs(12),
             max_batch_post_interval: Duration::from_secs(300),
         }
     }
@@ -189,11 +200,11 @@ impl<'de> Deserialize<'de> for Base64Bytes {
 
 pub struct BuildingBatch {
     /// Instance that handles the segments of the batch
-    segments: BatchSegments,
+    pub segments: BatchSegments,
     /// Message count at the start of the batch.
-    start_msg_count: u64,
+    pub start_msg_count: u64,
     /// Current message count of the batch.
-    msg_count: u64,
+    pub msg_count: u64,
 }
 
 impl BuildingBatch {
@@ -209,37 +220,34 @@ impl BuildingBatch {
 }
 
 pub struct BatchSegments {
-    compressed_buffer: Vec<u8>,
     compressed_writer: CompressorWriter<Vec<u8>>,
     raw_segments: Vec<Vec<u8>>,
     timestamp: u64,
     block_num: u64,
     delayed_msg: u64,
-    size_limit: u32,
+    size_limit: usize,
     compression_level: u32,
-    new_uncompressed_size: u32,
-    total_uncompressed_size: u32,
-    last_compressed_size: u32,
-    trailing_headers: u32,
+    new_uncompressed_size: usize,
+    total_uncompressed_size: usize,
+    last_compressed_size: usize,
+    trailing_headers: usize,
     is_done: bool,
 }
 
 impl BatchSegments {
+    // impl missing methods
+}
+
+impl BatchSegments {
     pub fn new(first_delayed: u64) -> Self {
-        let compressed_buffer = Vec::new();
         let buffer_size = 4096;
         let compression_level = 11;
         let lgwin = 22;
 
-        let compressed_writer = CompressorWriter::new(
-            compressed_buffer.clone(),
-            buffer_size,
-            compression_level,
-            lgwin,
-        );
+        let compressed_writer =
+            CompressorWriter::new(Vec::new(), buffer_size, compression_level, lgwin);
 
         Self {
-            compressed_buffer,
             compressed_writer,
             size_limit: 0, // not actually used
             compression_level,
@@ -253,5 +261,197 @@ impl BatchSegments {
             trailing_headers: 0,
             is_done: false,
         }
+    }
+}
+
+impl BatchSegments {
+    fn recompress_all(&mut self) -> anyhow::Result<()> {
+        self.compressed_writer =
+            CompressorWriter::new(Vec::new(), self.size_limit * 2, self.compression_level, 22);
+        self.new_uncompressed_size = 0;
+        self.total_uncompressed_size = 0;
+
+        for segment in self.raw_segments.clone() {
+            self.add_segment_to_compressed(segment)?;
+        }
+
+        if self.total_uncompressed_size > MAX_DECOMPRESSED_LEN {
+            return Err(anyhow::anyhow!(
+                "Batch size exceeds maximum decompressed length"
+            ));
+        }
+        if self.raw_segments.len() >= MAX_SEGMENTS_PER_SEQUENCER_MESSAGE {
+            return Err(anyhow::anyhow!(
+                "Number of raw segments exceeds maximum allowed"
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn test_for_overflow(&mut self, is_header: bool) -> anyhow::Result<bool> {
+        if self.total_uncompressed_size > MAX_DECOMPRESSED_LEN {
+            return Ok(true);
+        }
+
+        if self.raw_segments.len() >= MAX_SEGMENTS_PER_SEQUENCER_MESSAGE {
+            return Ok(true);
+        }
+
+        if (self.last_compressed_size + self.new_uncompressed_size) < self.size_limit {
+            return Ok(false);
+        }
+
+        if is_header || self.raw_segments.len() == self.trailing_headers {
+            return Ok(false);
+        }
+
+        self.compressed_writer.flush()?;
+        self.last_compressed_size = self.compressed_writer.get_ref().len();
+        self.new_uncompressed_size = 0;
+
+        if self.last_compressed_size >= self.size_limit {
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn close(&mut self) -> anyhow::Result<()> {
+        // Remove trailing headers
+        let len = self.raw_segments.len();
+        self.raw_segments
+            .truncate(len.saturating_sub(self.trailing_headers));
+        self.trailing_headers = 0;
+        self.recompress_all()?;
+        self.is_done = true;
+
+        Ok(())
+    }
+
+    fn add_segment_to_compressed(&mut self, segment: Vec<u8>) -> anyhow::Result<()> {
+        let encoded = rlp::encode(&segment);
+        let len_written = self.compressed_writer.write(&encoded)?;
+        self.new_uncompressed_size += len_written;
+        self.total_uncompressed_size += len_written;
+
+        Ok(())
+    }
+
+    pub fn add_segment(&mut self, segment: Vec<u8>, is_header: bool) -> anyhow::Result<bool> {
+        if self.is_done {
+            return Err(anyhow::anyhow!("Batch segments already closed"));
+        }
+
+        self.add_segment_to_compressed(segment.clone())?;
+
+        let overflow = self.test_for_overflow(is_header)?;
+        if overflow {
+            self.close()?;
+            return Ok(false);
+        }
+
+        self.raw_segments.push(segment);
+        if is_header {
+            self.trailing_headers += 1;
+        } else {
+            self.trailing_headers = 0;
+        }
+
+        Ok(true)
+    }
+
+    fn prepare_int_segment(&self, val: u64, segment_header: u8) -> Vec<u8> {
+        let mut segment = vec![segment_header];
+        segment.extend(rlp::encode(&val));
+        segment
+    }
+
+    fn maybe_add_diff_segment(
+        &mut self,
+        base: u64,
+        new_val: u64,
+        segment_header: u8,
+    ) -> anyhow::Result<bool> {
+        if new_val == base {
+            return Ok(true);
+        }
+        let diff = new_val - base;
+        let segment = self.prepare_int_segment(diff, segment_header);
+        let success = self.add_segment(segment, true)?;
+        Ok(success)
+    }
+
+    fn add_delayed_message(&mut self) -> anyhow::Result<bool> {
+        let segment = vec![BATCH_SEGMENT_KIND_DELAYED_MESSAGES];
+        let success = self.add_segment(segment, false)?;
+        if success {
+            self.delayed_msg += 1;
+        }
+        Ok(success)
+    }
+
+    pub fn add_message(&mut self, msg: &MessageWithMetadata) -> anyhow::Result<bool> {
+        if self.is_done {
+            return Err(anyhow::anyhow!("Batch segments already closed",));
+        }
+
+        if msg.delayed_messages_read > self.delayed_msg {
+            if msg.delayed_messages_read != self.delayed_msg + 1 {
+                return Err(anyhow::anyhow!(
+                    "Attempted to add delayed message {} after {}",
+                    msg.delayed_messages_read,
+                    self.delayed_msg
+                ));
+            }
+            return self.add_delayed_message();
+        }
+
+        let timestamp_success = self.maybe_add_diff_segment(
+            self.timestamp,
+            msg.message.header.timestamp,
+            BATCH_SEGMENT_KIND_ADVANCE_TIMESTAMP,
+        )?;
+        if !timestamp_success {
+            return Ok(false);
+        }
+        self.timestamp = msg.message.header.timestamp;
+
+        let block_num_success = self.maybe_add_diff_segment(
+            self.block_num,
+            msg.message.header.block_number,
+            BATCH_SEGMENT_KIND_ADVANCE_L1_BLOCK_NUMBER,
+        )?;
+        if !block_num_success {
+            return Ok(false);
+        }
+        self.block_num = msg.message.header.block_number;
+
+        self.add_l2_msg(msg.message.l2_msg.as_ref())
+    }
+
+    fn add_l2_msg(&mut self, l2msg: &[u8]) -> anyhow::Result<bool> {
+        let mut segment = vec![BATCH_SEGMENT_KIND_L2_MESSAGE];
+        segment.extend_from_slice(l2msg);
+        self.add_segment(segment, false)
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.is_done
+    }
+
+    pub fn close_and_get_bytes(&mut self) -> anyhow::Result<Option<Vec<u8>>> {
+        if !self.is_done {
+            self.close()?;
+        }
+
+        if self.raw_segments.is_empty() {
+            return Ok(None);
+        }
+
+        self.compressed_writer.flush()?;
+        let compressed_bytes = self.compressed_writer.get_ref();
+        let mut full_msg = vec![BROTLIMESSAGEHEADERBYTE];
+        full_msg.extend_from_slice(compressed_bytes);
+        Ok(Some(full_msg))
     }
 }
