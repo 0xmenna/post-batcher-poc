@@ -7,15 +7,14 @@ use ethers::{
     middleware::SignerMiddleware,
     providers::{Http, Provider},
     signers::LocalWallet,
-    types::{serde_helpers::deserialize_number, Address, BlockId, BlockNumber, H256, U256},
+    types::{serde_helpers::deserialize_number, Address, H256, U256},
 };
 use serde::Deserialize;
 use serde_json::Value;
-use std::{char::MAX, f32::consts::E, fs, io::Write, sync::Arc, time::Duration};
-use tokio::time::{self, Interval};
+use std::{fs, io::Write, sync::Arc, time::Duration};
 
 const BATCH_SEGMENT_KIND_L2_MESSAGE: u8 = 0;
-const BATCH_SEGMENT_KIND_L2_MESSAGE_BROTLI: u8 = 1;
+const _BATCH_SEGMENT_KIND_L2_MESSAGE_BROTLI: u8 = 1;
 const BATCH_SEGMENT_KIND_DELAYED_MESSAGES: u8 = 2;
 const BATCH_SEGMENT_KIND_ADVANCE_TIMESTAMP: u8 = 3;
 const BATCH_SEGMENT_KIND_ADVANCE_L1_BLOCK_NUMBER: u8 = 4;
@@ -23,7 +22,7 @@ const BATCH_SEGMENT_KIND_ADVANCE_L1_BLOCK_NUMBER: u8 = 4;
 const MAX_DECOMPRESSED_LEN: usize = 1024 * 1024 * 16; // 16 MiB
 const MAX_SEGMENTS_PER_SEQUENCER_MESSAGE: usize = 100 * 1024;
 
-const BROTLIMESSAGEHEADERBYTE: u8 = 0;
+const BROTLI_MESSAGE_HEADER_BYTE: u8 = 0;
 
 pub const L1_MESSAGE_TYPE_BATCH_POSTING_REPORT: u8 = 13;
 
@@ -32,10 +31,13 @@ pub const L1_MESSAGE_TYPE_BATCH_POSTING_REPORT: u8 = 13;
 pub struct Config {
     pub l1_url: String,
     pub feed_url: String,
+    pub feed_wait_interval_secs: u64,
+    pub retries_count: u32,
     pub privkey: String,
     pub sequencer_inbox_address: Address,
     pub contract_abi_path: String,
     pub max_batch_post_interval: Duration,
+    pub gas_refunder: Address,
 }
 
 /// Default configuration
@@ -43,8 +45,10 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            l1_url: "http://138.201.133.213:32769".to_string(),
+            l1_url: "http://138.201.133.213:32780".to_string(),
             feed_url: "ws://138.201.133.213:9642".to_string(),
+            feed_wait_interval_secs: 1,
+            retries_count: 20,
             privkey: "0x53321db7c1e331d93a11a41d16f004d7ff63972ec8ec7c25db329728ceeb1710"
                 .to_string(),
             sequencer_inbox_address: "0xA644B79509328CDf5BF2ebea5ad43071AE3d2c79"
@@ -52,6 +56,9 @@ impl Default for Config {
                 .unwrap(),
             contract_abi_path: "SequencerInbox.json".to_string(),
             max_batch_post_interval: Duration::from_secs(300),
+            gas_refunder: "0x614561D2d143621E126e87831AEF287678B442b8"
+                .parse()
+                .unwrap(),
         }
     }
 }
@@ -131,12 +138,6 @@ pub struct L1IncomingMessageHeader {
 #[derive(Debug, Clone)]
 pub struct BigInt(pub U256);
 
-impl BigInt {
-    pub fn new(s: &str) -> anyhow::Result<Self> {
-        Ok(BigInt(U256::from_dec_str(s)?))
-    }
-}
-
 impl<'de> Deserialize<'de> for BigInt {
     fn deserialize<D>(deserializer: D) -> Result<BigInt, D::Error>
     where
@@ -165,12 +166,6 @@ pub type Signature = Base64Bytes;
 
 #[derive(Debug, Clone)]
 pub struct Base64Bytes(pub Vec<u8>);
-
-impl Base64Bytes {
-    pub fn to_vec(&self) -> Vec<u8> {
-        self.0.clone()
-    }
-}
 
 impl From<Vec<u8>> for Base64Bytes {
     fn from(val: Vec<u8>) -> Self {
@@ -249,7 +244,7 @@ impl BatchSegments {
 
         Self {
             compressed_writer,
-            size_limit: 0, // not actually used
+            size_limit: 90000,
             compression_level,
             raw_segments: Vec::new(),
             delayed_msg: first_delayed,
@@ -337,7 +332,7 @@ impl BatchSegments {
         Ok(())
     }
 
-    pub fn add_segment(&mut self, segment: Vec<u8>, is_header: bool) -> anyhow::Result<bool> {
+    pub fn add_segment(&mut self, segment: Vec<u8>, is_header: bool) -> anyhow::Result<()> {
         if self.is_done {
             return Err(anyhow::anyhow!("Batch segments already closed"));
         }
@@ -346,8 +341,11 @@ impl BatchSegments {
 
         let overflow = self.test_for_overflow(is_header)?;
         if overflow {
-            self.close()?;
-            return Ok(false);
+            // current implementation just returns an error if it overflows
+            return Err(anyhow::anyhow!("Batch segments overflowed"));
+
+            // self.close()?;
+            // return Ok(());
         }
 
         self.raw_segments.push(segment);
@@ -357,7 +355,7 @@ impl BatchSegments {
             self.trailing_headers = 0;
         }
 
-        Ok(true)
+        Ok(())
     }
 
     fn prepare_int_segment(&self, val: u64, segment_header: u8) -> Vec<u8> {
@@ -371,26 +369,26 @@ impl BatchSegments {
         base: u64,
         new_val: u64,
         segment_header: u8,
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<()> {
         if new_val == base {
-            return Ok(true);
+            return Ok(());
         }
         let diff = new_val - base;
         let segment = self.prepare_int_segment(diff, segment_header);
-        let success = self.add_segment(segment, true)?;
-        Ok(success)
+        self.add_segment(segment, true)?;
+
+        Ok(())
     }
 
-    fn add_delayed_message(&mut self) -> anyhow::Result<bool> {
+    fn add_delayed_message(&mut self) -> anyhow::Result<()> {
         let segment = vec![BATCH_SEGMENT_KIND_DELAYED_MESSAGES];
-        let success = self.add_segment(segment, false)?;
-        if success {
-            self.delayed_msg += 1;
-        }
-        Ok(success)
+        self.add_segment(segment, false)?;
+        self.delayed_msg += 1;
+
+        Ok(())
     }
 
-    pub fn add_message(&mut self, msg: &MessageWithMetadata) -> anyhow::Result<bool> {
+    pub fn add_message(&mut self, msg: &MessageWithMetadata) -> anyhow::Result<()> {
         if self.is_done {
             return Err(anyhow::anyhow!("Batch segments already closed",));
         }
@@ -406,37 +404,33 @@ impl BatchSegments {
             return self.add_delayed_message();
         }
 
-        let timestamp_success = self.maybe_add_diff_segment(
+        self.maybe_add_diff_segment(
             self.timestamp,
             msg.message.header.timestamp,
             BATCH_SEGMENT_KIND_ADVANCE_TIMESTAMP,
         )?;
-        if !timestamp_success {
-            return Ok(false);
-        }
+
         self.timestamp = msg.message.header.timestamp;
 
-        let block_num_success = self.maybe_add_diff_segment(
+        self.maybe_add_diff_segment(
             self.block_num,
             msg.message.header.block_number,
             BATCH_SEGMENT_KIND_ADVANCE_L1_BLOCK_NUMBER,
         )?;
-        if !block_num_success {
-            return Ok(false);
-        }
+
         self.block_num = msg.message.header.block_number;
 
         self.add_l2_msg(msg.message.l2_msg.as_ref())
     }
 
-    fn add_l2_msg(&mut self, l2msg: &[u8]) -> anyhow::Result<bool> {
+    fn add_l2_msg(&mut self, l2msg: &[u8]) -> anyhow::Result<()> {
         let mut segment = vec![BATCH_SEGMENT_KIND_L2_MESSAGE];
         segment.extend_from_slice(l2msg);
         self.add_segment(segment, false)
     }
 
-    pub fn is_done(&self) -> bool {
-        self.is_done
+    pub fn delayed_msg(&self) -> u64 {
+        self.delayed_msg
     }
 
     pub fn close_and_get_bytes(&mut self) -> anyhow::Result<Option<Vec<u8>>> {
@@ -450,7 +444,7 @@ impl BatchSegments {
 
         self.compressed_writer.flush()?;
         let compressed_bytes = self.compressed_writer.get_ref();
-        let mut full_msg = vec![BROTLIMESSAGEHEADERBYTE];
+        let mut full_msg = vec![BROTLI_MESSAGE_HEADER_BYTE];
         full_msg.extend_from_slice(compressed_bytes);
         Ok(Some(full_msg))
     }
