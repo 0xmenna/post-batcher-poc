@@ -14,4 +14,5 @@ async fn main() -> Result<()> {
 }
 
 mod batchposter;
+mod db;
 mod types;

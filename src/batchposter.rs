@@ -1,18 +1,18 @@
-use crate::types::{
-    inbox_contract_from, BatchPosterPosition, BroadcastFeedMessage, BroadcastMessage,
-    BuildingBatch, Config, InboxContract, L1_MESSAGE_TYPE_BATCH_POSTING_REPORT,
+use crate::{
+    db::BatchPosterDb,
+    types::{
+        inbox_contract_from, BatchPosterPosition, BroadcastMessage, BuildingBatch, Config,
+        InboxContract, GAS_LIMIT,
+    },
 };
 use anyhow::Result;
-use ethers::types::{Address, Bytes, U256};
+use ethers::types::{Address, Bytes, TransactionReceipt, U256};
 use futures_util::StreamExt;
-use std::{
-    mem,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::{
     sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
     task::JoinHandle,
-    time::{self},
+    time::{self, Interval},
 };
 use tokio_tungstenite::connect_async;
 
@@ -20,21 +20,19 @@ use tokio_tungstenite::connect_async;
 // It holds all the state in memory and does not have failure recovery mechanisms.
 pub struct BatchPoster {
     feed_handler: SequencerFeedHandler,
-
     sequencer_inbox: InboxContract,
     max_batch_post_interval: Duration,
     gas_refunder: Address,
-    building_batch: Option<BuildingBatch>,
-    batchposter_position: BatchPosterPosition,
-    incoming_messages: Vec<BroadcastFeedMessage>,
-    first_incoming_msg_time: Option<SystemTime>,
-    msg_count: u64,
+    db: BatchPosterDb,
+    poll_interval: Interval,
 }
 
 impl From<Config> for BatchPoster {
     fn from(config: Config) -> Self {
         let sequencer_inbox = inbox_contract_from(&config);
+        let db = BatchPosterDb::from_path(&config.db_path).unwrap();
 
+        let poll_interval = time::interval(config.poll_interval);
         Self {
             feed_handler: SequencerFeedHandler::new(
                 config.feed_url,
@@ -44,15 +42,8 @@ impl From<Config> for BatchPoster {
             sequencer_inbox,
             max_batch_post_interval: config.max_batch_post_interval,
             gas_refunder: config.gas_refunder,
-            building_batch: Default::default(),
-            batchposter_position: BatchPosterPosition {
-                msg_count: 1,
-                delayed_msg_count: 1,
-                next_seq_number: 1,
-            },
-            incoming_messages: Vec::new(),
-            first_incoming_msg_time: None,
-            msg_count: 1,
+            db,
+            poll_interval,
         }
     }
 }
@@ -108,6 +99,7 @@ impl BatchPoster {
                 }
                 let json_str = msg.to_text().unwrap();
                 let broadcast_msg: BroadcastMessage = serde_json::from_str(json_str)?;
+                log::info!("Producing broadcast message: {:?}", broadcast_msg);
                 producer.send(broadcast_msg)?;
             }
 
@@ -116,93 +108,94 @@ impl BatchPoster {
     }
 
     pub async fn consume_feed_and_batch_post(&mut self) -> Result<()> {
+        // The latest batch poster position
+        let mut batchposter_position = self.db.read_batch_position()?;
+        // The latest sequence number of the batch being posted
+        let mut seq_number = self.db.read_seq_number()?;
+        // The time of the first message in the current batch
+        let mut first_incoming_msg_time = None;
+        // The current batch being built
+        let mut building_batch = None;
+
         let consumer = self.feed_handler.consumer();
-
-        log::info!("Waiting for incoming messages...");
-        while let Some(broadcast_msg) = consumer.recv().await {
-            if !broadcast_msg.messages.is_empty() {
-                self.incoming_messages
-                    .extend_from_slice(&broadcast_msg.messages);
-
-                self.msg_count += broadcast_msg.messages.len() as u64;
-                log::info!("Total number of messages: {}", self.msg_count);
-            }
-
-            if self.first_incoming_msg_time.is_none() {
-                // find the first message to set the time of the batch initialization to later force a batch post
-                self.first_incoming_msg_time = self.incoming_messages.first().map(|msg| {
-                    UNIX_EPOCH + Duration::from_secs(msg.message.message.header.timestamp)
-                });
-
-                log::info!("Time of a new batch: {:?}", self.first_incoming_msg_time);
-            }
-
-            if self.building_batch.is_none() {
-                self.building_batch = Some(BuildingBatch::new(
-                    self.batchposter_position.msg_count,
-                    self.batchposter_position.msg_count,
-                    self.batchposter_position.delayed_msg_count,
-                ));
-            }
-
-            let force_post_batch = self.first_incoming_msg_time.map_or(false, |msg_time| {
+        // Pull feed messages indefinitely
+        loop {
+            // check if we need to send the batch
+            let send_batch = first_incoming_msg_time.map_or(false, |msg_time: SystemTime| {
                 msg_time.elapsed().unwrap() >= self.max_batch_post_interval
             });
 
-            let mut have_useful_message = false;
+            if send_batch {
+                let batch = building_batch.as_mut().unwrap();
+                post_batch(
+                    batch,
+                    &self.sequencer_inbox,
+                    &batchposter_position,
+                    self.gas_refunder,
+                )
+                .await?;
 
-            let dispatchable_messages = mem::take(&mut self.incoming_messages);
+                batchposter_position = BatchPosterPosition {
+                    msg_count: batch.msg_count,
+                    delayed_msg_count: batch.segments.delayed_msg(),
+                    next_seq_number: batchposter_position.next_seq_number + 1,
+                };
+                first_incoming_msg_time = None;
+                building_batch = None;
 
-            let maybe_building = self.building_batch.as_mut();
-            let building = maybe_building.unwrap();
-            for msg in dispatchable_messages {
-                log::info!("Processing message: {:?}", msg);
-                let msg = msg.message;
-                building.segments.add_message(&msg)?;
+                // checkpoint the batch operation
+                self.db
+                    .write_checkpoint(&batchposter_position, seq_number)?;
 
-                if msg.message.header.kind != L1_MESSAGE_TYPE_BATCH_POSTING_REPORT {
-                    have_useful_message = true;
+                log::info!(
+                    "Checkpoint at height {}: {:?}",
+                    seq_number,
+                    batchposter_position,
+                );
+            }
+
+            let maybe_broadcast_msg = consumer.try_recv();
+
+            if let Ok(broadcast_msg) = maybe_broadcast_msg {
+                for msg in broadcast_msg.messages.iter() {
+                    if msg.sequence_number <= seq_number {
+                        log::info!(
+                            "Skipping message with sequence number: {}",
+                            msg.sequence_number
+                        );
+                        continue;
+                    }
+                    log::info!(
+                        "Processing message with sequence number: {}",
+                        msg.sequence_number
+                    );
+
+                    if first_incoming_msg_time.is_none() {
+                        // Set the time of the first message in the batch
+                        first_incoming_msg_time = Some(
+                            UNIX_EPOCH + Duration::from_secs(msg.message.message.header.timestamp),
+                        );
+                    }
+
+                    if building_batch.is_none() {
+                        building_batch = Some(BuildingBatch::new(
+                            batchposter_position.msg_count,
+                            batchposter_position.msg_count,
+                            batchposter_position.delayed_msg_count,
+                        ));
+                    }
+                    let building = building_batch.as_mut().unwrap();
+
+                    let msg_with_meta = &msg.message;
+                    building.segments.add_message(msg_with_meta)?;
+
+                    building.msg_count += 1;
+                    seq_number = msg.sequence_number;
                 }
-                building.msg_count += 1;
+            } else {
+                self.poll_interval.tick().await;
             }
-
-            if !force_post_batch || !have_useful_message {
-                // the batch isn't full yet and we've posted a batch recently
-                // don't post anything for now
-                continue;
-            }
-
-            let sequencer_msg = building.segments.close_and_get_bytes()?;
-
-            if sequencer_msg.is_none() {
-                self.building_batch = None;
-                self.first_incoming_msg_time = None;
-                continue;
-            }
-
-            let _ = add_batch_tx(
-                &self.sequencer_inbox,
-                self.batchposter_position.next_seq_number,
-                sequencer_msg.unwrap(),
-                building.segments.delayed_msg(),
-                self.gas_refunder,
-                self.batchposter_position.msg_count,
-                building.msg_count,
-            )
-            .await?;
-
-            self.batchposter_position = BatchPosterPosition {
-                msg_count: building.msg_count,
-                delayed_msg_count: building.segments.delayed_msg(),
-                next_seq_number: self.batchposter_position.next_seq_number + 1,
-            };
-            self.building_batch = None;
-            self.first_incoming_msg_time = None;
         }
-
-        Err(anyhow::anyhow!(
-            "Consumer stopped, incoming feed must not stop"
-        ))
     }
 }
 
@@ -238,7 +231,33 @@ impl SequencerFeedHandler {
     }
 }
 
-pub async fn add_batch_tx(
+pub async fn post_batch(
+    batch: &mut BuildingBatch,
+    contract: &InboxContract,
+    batchposter_pos: &BatchPosterPosition,
+    gas_refunder: Address,
+) -> Result<bool> {
+    let sequencer_msg = batch.segments.close_and_get_bytes()?;
+
+    if sequencer_msg.is_none() {
+        return Ok(false);
+    }
+
+    post_batch_tx(
+        contract,
+        batchposter_pos.next_seq_number,
+        sequencer_msg.unwrap(),
+        batch.segments.delayed_msg(),
+        gas_refunder,
+        batchposter_pos.msg_count,
+        batch.msg_count,
+    )
+    .await?;
+
+    Ok(true)
+}
+
+pub async fn post_batch_tx(
     contract: &InboxContract,
     sequence_number: u64,
     data: Vec<u8>,
@@ -247,10 +266,20 @@ pub async fn add_batch_tx(
     prev_msg_count: u64,
     new_msg_count: u64,
 ) -> Result<()> {
+    let sequence_number: U256 = sequence_number.into();
     let after_delayed_messages_read: U256 = after_delayed_msg.into();
     let prev_message_count: U256 = prev_msg_count.into();
     let new_message_count: U256 = new_msg_count.into();
     let data = Bytes::from(data);
+
+    log::info!(
+        "Adding batch with sequence number: {} - after_delayed_messages_read: {} - gas_refunder: {} - prev_message_count: {} - new_message_count: {}",
+        sequence_number,
+        after_delayed_messages_read,
+        gas_refunder,
+        prev_message_count,
+        new_message_count
+    );
 
     let tx = contract.method::<_, ()>(
         "addSequencerL2BatchFromOrigin",
@@ -263,8 +292,29 @@ pub async fn add_batch_tx(
             new_message_count,
         ),
     )?;
+    // Set a higher gas limit
+    let tx = tx.gas(GAS_LIMIT);
 
-    let _receipt = tx.send().await?;
+    let pending_tx = tx.send().await?;
+    log::info!("Batch Transaction sent! Hash: {:?}", pending_tx.tx_hash());
+
+    // Wait for the transaction to be included in a block
+    let receipt = pending_tx.await?;
+    log_receipt(receipt);
 
     Ok(())
+}
+
+pub fn log_receipt(receipt: Option<TransactionReceipt>) {
+    match receipt {
+        Some(receipt) => {
+            log::info!(
+                "Transaction included! Block number: {:?}",
+                receipt.block_number
+            );
+        }
+        None => {
+            log::info!("Transaction not included");
+        }
+    }
 }

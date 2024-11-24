@@ -1,12 +1,13 @@
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use brotli::CompressorWriter;
+use codec::{Decode, Encode};
 use ethers::{
     abi::Abi,
     contract::Contract,
     middleware::SignerMiddleware,
     providers::{Http, Provider},
-    signers::LocalWallet,
+    signers::{LocalWallet, Signer},
     types::{serde_helpers::deserialize_number, Address, H256, U256},
 };
 use serde::Deserialize;
@@ -24,20 +25,25 @@ const MAX_SEGMENTS_PER_SEQUENCER_MESSAGE: usize = 100 * 1024;
 
 const BROTLI_MESSAGE_HEADER_BYTE: u8 = 0;
 
-pub const L1_MESSAGE_TYPE_BATCH_POSTING_REPORT: u8 = 13;
+pub const _L1_MESSAGE_TYPE_BATCH_POSTING_REPORT: u8 = 13;
+
+pub const GAS_LIMIT: u64 = 300_000u64;
 
 /// Simple configuration for the batch poster
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
+    pub parent_chain_id: u64,
     pub l1_url: String,
     pub feed_url: String,
     pub feed_wait_interval_secs: u64,
     pub retries_count: u32,
+    pub poll_interval: Duration,
     pub privkey: String,
     pub sequencer_inbox_address: Address,
     pub contract_abi_path: String,
     pub max_batch_post_interval: Duration,
     pub gas_refunder: Address,
+    pub db_path: String,
 }
 
 /// Default configuration
@@ -45,20 +51,21 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            l1_url: "http://138.201.133.213:32780".to_string(),
+            parent_chain_id: 3151908,
+            l1_url: "http://138.201.133.213:32791".to_string(),
             feed_url: "ws://138.201.133.213:9642".to_string(),
             feed_wait_interval_secs: 1,
             retries_count: 20,
+            poll_interval: Duration::from_secs(3),
             privkey: "0x53321db7c1e331d93a11a41d16f004d7ff63972ec8ec7c25db329728ceeb1710"
                 .to_string(),
             sequencer_inbox_address: "0xA644B79509328CDf5BF2ebea5ad43071AE3d2c79"
                 .parse()
                 .unwrap(),
             contract_abi_path: "SequencerInbox.json".to_string(),
-            max_batch_post_interval: Duration::from_secs(300),
-            gas_refunder: "0x614561D2d143621E126e87831AEF287678B442b8"
-                .parse()
-                .unwrap(),
+            max_batch_post_interval: Duration::from_secs(120),
+            gas_refunder: Address::zero(),
+            db_path: "db".to_string(),
         }
     }
 }
@@ -67,7 +74,11 @@ pub type InboxContract = Contract<SignerMiddleware<Provider<Http>, LocalWallet>>
 
 pub fn inbox_contract_from(config: &Config) -> InboxContract {
     let provider = Provider::<Http>::try_from(&config.l1_url).unwrap();
-    let wallet = config.privkey.parse::<LocalWallet>().unwrap();
+    let wallet = config
+        .privkey
+        .parse::<LocalWallet>()
+        .unwrap()
+        .with_chain_id(config.parent_chain_id);
     let client = Arc::new(SignerMiddleware::new(provider, wallet));
 
     let contract_artifact = fs::read_to_string(&config.contract_abi_path).unwrap();
@@ -80,11 +91,21 @@ pub fn inbox_contract_from(config: &Config) -> InboxContract {
     sequencer_inbox
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Encode, Decode)]
 pub struct BatchPosterPosition {
     pub msg_count: u64,
     pub delayed_msg_count: u64,
     pub next_seq_number: u64,
+}
+
+impl Default for BatchPosterPosition {
+    fn default() -> Self {
+        Self {
+            msg_count: 1,
+            delayed_msg_count: 1,
+            next_seq_number: 1,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
