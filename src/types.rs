@@ -9,6 +9,7 @@ use ethers::{
     providers::{Http, Provider},
     signers::{LocalWallet, Signer},
     types::{serde_helpers::deserialize_number, Address, H256, U256},
+    utils::rlp,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -52,7 +53,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             parent_chain_id: 3151908,
-            l1_url: "http://138.201.133.213:32791".to_string(),
+            l1_url: "http://138.201.133.213:32813".to_string(),
             feed_url: "ws://138.201.133.213:9642".to_string(),
             feed_wait_interval_secs: 1,
             retries_count: 20,
@@ -206,6 +207,7 @@ impl<'de> Deserialize<'de> for Base64Bytes {
         D: serde::Deserializer<'de>,
     {
         let base64_str = String::deserialize(deserializer)?;
+        println!("base64_str: {}", base64_str);
         let l2_msg = BASE64
             .decode(&base64_str)
             .map_err(|_| serde::de::Error::custom("Base64 L2Msg has invalid format"))?;
@@ -235,14 +237,16 @@ impl BuildingBatch {
     }
 }
 
+const COMPRESSION_LEVEL: u32 = 11;
+const LGWIN: u32 = 22;
+pub const MAX_SIZE: usize = 90000;
+
 pub struct BatchSegments {
     compressed_writer: CompressorWriter<Vec<u8>>,
     raw_segments: Vec<Vec<u8>>,
     timestamp: u64,
     block_num: u64,
     delayed_msg: u64,
-    size_limit: usize,
-    compression_level: u32,
     new_uncompressed_size: usize,
     total_uncompressed_size: usize,
     last_compressed_size: usize,
@@ -251,22 +255,12 @@ pub struct BatchSegments {
 }
 
 impl BatchSegments {
-    // impl missing methods
-}
-
-impl BatchSegments {
     pub fn new(first_delayed: u64) -> Self {
-        let buffer_size = 4096;
-        let compression_level = 11;
-        let lgwin = 22;
-
         let compressed_writer =
-            CompressorWriter::new(Vec::new(), buffer_size, compression_level, lgwin);
+            CompressorWriter::new(Vec::new(), MAX_SIZE * 2, COMPRESSION_LEVEL, LGWIN);
 
         Self {
             compressed_writer,
-            size_limit: 90000,
-            compression_level,
             raw_segments: Vec::new(),
             delayed_msg: first_delayed,
             timestamp: 0,
@@ -283,7 +277,7 @@ impl BatchSegments {
 impl BatchSegments {
     fn recompress_all(&mut self) -> anyhow::Result<()> {
         self.compressed_writer =
-            CompressorWriter::new(Vec::new(), self.size_limit * 2, self.compression_level, 22);
+            CompressorWriter::new(Vec::new(), MAX_SIZE * 2, COMPRESSION_LEVEL, LGWIN);
         self.new_uncompressed_size = 0;
         self.total_uncompressed_size = 0;
 
@@ -314,7 +308,7 @@ impl BatchSegments {
             return Ok(true);
         }
 
-        if (self.last_compressed_size + self.new_uncompressed_size) < self.size_limit {
+        if (self.last_compressed_size + self.new_uncompressed_size) < MAX_SIZE {
             return Ok(false);
         }
 
@@ -326,7 +320,7 @@ impl BatchSegments {
         self.last_compressed_size = self.compressed_writer.get_ref().len();
         self.new_uncompressed_size = 0;
 
-        if self.last_compressed_size >= self.size_limit {
+        if self.last_compressed_size >= MAX_SIZE {
             return Ok(true);
         }
         Ok(false)
@@ -454,7 +448,7 @@ impl BatchSegments {
         self.delayed_msg
     }
 
-    pub fn close_and_get_bytes(&mut self) -> anyhow::Result<Option<Vec<u8>>> {
+    pub fn close_and_get_bytes(mut self) -> anyhow::Result<Option<Vec<u8>>> {
         if !self.is_done {
             self.close()?;
         }
@@ -464,9 +458,9 @@ impl BatchSegments {
         }
 
         self.compressed_writer.flush()?;
-        let compressed_bytes = self.compressed_writer.get_ref();
-        let mut full_msg = vec![BROTLI_MESSAGE_HEADER_BYTE];
-        full_msg.extend_from_slice(compressed_bytes);
+        let compressed_bytes = self.compressed_writer.into_inner();
+        let mut full_msg: Vec<u8> = vec![BROTLI_MESSAGE_HEADER_BYTE];
+        full_msg.extend_from_slice(&compressed_bytes);
         Ok(Some(full_msg))
     }
 }

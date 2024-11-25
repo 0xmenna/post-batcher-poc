@@ -16,8 +16,7 @@ use tokio::{
 };
 use tokio_tungstenite::connect_async;
 
-// This PoC implementation is not fault-tolerant:
-// It holds all the state in memory and does not have failure recovery mechanisms.
+// PoC implementation of a BatchPoster
 pub struct BatchPoster {
     feed_handler: SequencerFeedHandler,
     sequencer_inbox: InboxContract,
@@ -99,7 +98,10 @@ impl BatchPoster {
                 }
                 let json_str = msg.to_text().unwrap();
                 let broadcast_msg: BroadcastMessage = serde_json::from_str(json_str)?;
-                log::info!("Producing broadcast message: {:?}", broadcast_msg);
+                log::info!(
+                    "Producing broadcast message of length: {:?}",
+                    broadcast_msg.messages.len()
+                );
                 producer.send(broadcast_msg)?;
             }
 
@@ -126,7 +128,10 @@ impl BatchPoster {
             });
 
             if send_batch {
-                let batch = building_batch.as_mut().unwrap();
+                let batch: BuildingBatch = building_batch.unwrap();
+                let batch_msg_count = batch.msg_count;
+                let batch_delayed_msg_count = batch.segments.delayed_msg();
+
                 post_batch(
                     batch,
                     &self.sequencer_inbox,
@@ -136,8 +141,8 @@ impl BatchPoster {
                 .await?;
 
                 batchposter_position = BatchPosterPosition {
-                    msg_count: batch.msg_count,
-                    delayed_msg_count: batch.segments.delayed_msg(),
+                    msg_count: batch_msg_count,
+                    delayed_msg_count: batch_delayed_msg_count,
                     next_seq_number: batchposter_position.next_seq_number + 1,
                 };
                 first_incoming_msg_time = None;
@@ -165,6 +170,7 @@ impl BatchPoster {
                         );
                         continue;
                     }
+
                     log::info!(
                         "Processing message with sequence number: {}",
                         msg.sequence_number
@@ -232,11 +238,12 @@ impl SequencerFeedHandler {
 }
 
 pub async fn post_batch(
-    batch: &mut BuildingBatch,
+    batch: BuildingBatch,
     contract: &InboxContract,
     batchposter_pos: &BatchPosterPosition,
     gas_refunder: Address,
 ) -> Result<bool> {
+    let after_delayed_msg = batch.segments.delayed_msg();
     let sequencer_msg = batch.segments.close_and_get_bytes()?;
 
     if sequencer_msg.is_none() {
@@ -247,7 +254,7 @@ pub async fn post_batch(
         contract,
         batchposter_pos.next_seq_number,
         sequencer_msg.unwrap(),
-        batch.segments.delayed_msg(),
+        after_delayed_msg,
         gas_refunder,
         batchposter_pos.msg_count,
         batch.msg_count,
